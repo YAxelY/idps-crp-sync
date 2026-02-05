@@ -1,0 +1,7 @@
+**/__pycache__/
+*.pyc
+*.npy
+data/megapixel_mnist/dsets/
+data/megapixel_mnist/dsets/megapixel_mnist
+results/*.pth
+condavenv/

@@ -27,8 +27,27 @@ class IDPSNet(nn.Module):
         # Aggregator (Transformer) runs on the K selected patches
         self.transf = Transformer(conf.n_token, conf.H, conf.D, conf.D_k, conf.D_v, conf.D_inner, conf.attn_dropout, conf.dropout)
         
-        # Head
-        self.head = nn.Linear(self.D, self.n_class)
+        # Heads (one per task)
+        self.tasks = conf.tasks
+        self.output_layers = self.get_output_layers(conf.tasks)
+
+    def get_output_layers(self, tasks):
+        """
+        Create an output layer for each task according to task definition
+        """
+        output_layers = nn.ModuleDict()
+        for task in tasks.values():
+            if task['act_fn'] == 'softmax':
+                act_fn = nn.Softmax(dim=-1)
+            elif task['act_fn'] == 'sigmoid':
+                act_fn = nn.Sigmoid()
+            
+            layers = [
+                nn.Linear(self.D, self.n_class),
+                act_fn
+            ]
+            output_layers[task['name']] = nn.Sequential(*layers)
+        return output_layers
 
     def _get_embeddings(self, patches):
         B_dim = -1
@@ -86,13 +105,23 @@ class IDPSNet(nn.Module):
         selected_embeddings = torch.matmul(indicators, embeddings)
         
         # 5. Aggregate (Transformer)
-        # Output is (B, n_token, D). with n_token=1, it is (B, 1, D)
-        slide_embedding = self.transf(selected_embeddings).squeeze(1) # (B, D)
+        # Output is (B, n_token, D).
+        slide_embeddings = self.transf(selected_embeddings) # (B, n_token, D)
         
-        # 6. Classify
-        logits = self.head(slide_embedding)
+        # 6. Classify for each task
+        preds = {}
+        for task in self.tasks.values():
+            t_name, t_id = task['name'], task['id']
+            layer = self.output_layers[t_name]
+
+            # If n_token > 1, we assume specific tokens for specific tasks 
+            # (assuming n_token matches number of tasks and ordered by ID, 
+            # OR we just use the t_id-th token)
+            # IPSNet uses `emb = embeddings[:,t_id]`
+            emb = slide_embeddings[:, t_id]
+            preds[t_name] = layer(emb)
         
-        return logits
+        return preds
 
     def forward(self, x, mode='train'):
         """

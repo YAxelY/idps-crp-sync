@@ -6,19 +6,18 @@ from architecture.idps_net import IDPSNet
 from utils.utils import adjust_learning_rate, get_gpu_memory, Timer, save_results
 
 class IDPSTrainer:
-    def __init__(self, model: IDPSNet, dataset, conf):
+    def __init__(self, model: IDPSNet, dataset, criterions, log_writer, conf):
         self.model = model
         self.dataset = dataset
         self.conf = conf
         self.optimizer = optim.Adam(model.parameters(), lr=conf.lr)
-        self.criterion = nn.CrossEntropyLoss()
+        self.criterions = criterions
+        self.log_writer = log_writer
         self.global_step = 0
         
     def train_epoch(self, dataloader, epoch):
         self.model.train()
         timer = Timer()
-        metrics = {'loss': 0, 'acc': 0}
-        total_batches = len(dataloader)
         
         for i, batch_data in enumerate(dataloader):
             # Dynamic LR
@@ -34,79 +33,89 @@ class IDPSTrainer:
             top_m_indices_cpu = top_m_indices.cpu()
             candidate_patches = self.dataset.get_learner_data(batch_data, top_m_indices_cpu).to(self.model.device)
             self.optimizer.zero_grad()
-            logits = self.model.training_pass(candidate_patches)
             
-            # Labels
-            labels = batch_data['label'].clone().detach().to(self.model.device).long()
+            # Forward (returns dict of predictions)
+            preds = self.model.training_pass(candidate_patches)
             
-            loss = self.criterion(logits, labels)
+            # Compute loss
+            loss = 0
+            task_losses, task_preds, task_labels = {}, {}, {}
+            
+            for task in self.conf.tasks.values():
+                t_name, t_act = task['name'], task['act_fn']
+                criterion = self.criterions[t_name]
+                
+                label = batch_data[t_name].to(self.model.device)
+                pred = preds[t_name].squeeze(-1)
+                
+                if t_act == 'softmax':
+                    pred_loss = torch.log(pred + self.conf.eps)
+                    label_loss = label
+                else:
+                    pred_loss = pred.view(-1)
+                    label_loss = label.view(-1).type(torch.float32)
+
+                task_loss = criterion(pred_loss, label_loss)
+                
+                task_losses[t_name] = task_loss.item()
+                task_preds[t_name] = pred.detach().cpu().numpy()
+                task_labels[t_name] = label.detach().cpu().numpy()
+                loss += task_loss
+
+            loss /= len(self.conf.tasks.values())
+            
             loss.backward()
             self.optimizer.step()
-            
-            # Metrics
-            pred = logits.argmax(dim=1)
-            acc = (pred == labels).float().mean().item()
-            
-            metrics['loss'] += loss.item()
-            metrics['acc'] += acc
             self.global_step += 1
             
-        # Average Metrics
-        metrics = {k: v / total_batches for k, v in metrics.items()}
+            # Update log
+            self.log_writer.update(task_losses, task_preds, task_labels)
+
+        # Perf metrics can be handled outside or added to log_writer if supported
+        # For now, we rely on log_writer.compute_metric() in main loop
         
-        # Add perf metrics
-        metrics['vram_gb'] = get_gpu_memory()
-        metrics['time_sec'] = timer.elapsed()
-        metrics['lr'] = self.optimizer.param_groups[0]['lr']
-        
-        # Save results (Train)
-        metrics['phase'] = 'train'
-        save_results(self.conf.results_dir, epoch, metrics, self.model.state_dict())
-        
-        return metrics
+        return {} # Metrics handled by log_writer
 
     @torch.no_grad()
     def evaluate(self, dataloader, epoch):
         self.model.eval()
-        timer = Timer()
-        metrics = {'loss': 0, 'acc': 0}
-        total_batches = len(dataloader)
         
         for i, batch_data in enumerate(dataloader):
             # --- PASS 1: SCOUT ---
             low_res_patches = self.dataset.get_scout_data(batch_data).to(self.model.device)
-            top_m_indices = self.model.scouting_pass(low_res_patches) # (B, M)
+            top_m_indices = self.model.scouting_pass(low_res_patches) 
             
-            # --- PASS 2: LEARNER (With DPS) ---
-            # Move indices to CPU for indexing into dataset (which is on CPU)
+            # --- PASS 2: LEARNER ---
             top_m_indices_cpu = top_m_indices.cpu()
             candidate_patches = self.dataset.get_learner_data(batch_data, top_m_indices_cpu).to(self.model.device)
-            logits = self.model.training_pass(candidate_patches)
             
-            # Labels
-            labels = batch_data['label'].clone().detach().to(self.model.device).long()
+            preds = self.model.training_pass(candidate_patches)
             
-            loss = self.criterion(logits, labels)
+             # Compute loss
+            loss = 0
+            task_losses, task_preds, task_labels = {}, {}, {}
             
-            # Metrics
-            pred = logits.argmax(dim=1)
-            acc = (pred == labels).float().mean().item()
+            for task in self.conf.tasks.values():
+                t_name, t_act = task['name'], task['act_fn']
+                criterion = self.criterions[t_name]
+                
+                label = batch_data[t_name].to(self.model.device)
+                pred = preds[t_name].squeeze(-1)
+                
+                if t_act == 'softmax':
+                    pred_loss = torch.log(pred + self.conf.eps)
+                    label_loss = label
+                else:
+                    pred_loss = pred.view(-1)
+                    label_loss = label.view(-1).type(torch.float32)
+
+                task_loss = criterion(pred_loss, label_loss)
+                
+                task_losses[t_name] = task_loss.item()
+                task_preds[t_name] = pred.detach().cpu().numpy()
+                task_labels[t_name] = label.detach().cpu().numpy()
             
-            metrics['loss'] += loss.item()
-            metrics['acc'] += acc
-            
-        # Average Metrics
-        metrics = {k: v / total_batches for k, v in metrics.items()}
+            self.log_writer.update(task_losses, task_preds, task_labels)
         
-        # Add perf metrics
-        metrics['vram_gb'] = get_gpu_memory()
-        metrics['time_sec'] = timer.elapsed()
-        metrics['phase'] = 'test'
-        
-        # Save results (Test) - Note: separate log or same? 
-        # save_results appends to json, so it will just add another entry.
-        # We might want to save just metrics without checking point too often, but it handles it.
-        save_results(self.conf.results_dir, epoch, metrics, None) # No checkpoint regarding test usually, or 'best' logic
-        
-        return metrics
+        return {}
 
