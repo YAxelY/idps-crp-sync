@@ -13,8 +13,8 @@ data_dir: 'data/megapixel_mnist/dsets/megapixel_mnist_1500'   # directory of dat
 n_worker: 2                                                   # number of workers
 pin_memory: True                                              # use pin memory in dataloader
 eager: True                                                   # eager or lazy loading
-downsample: True        # whether to downsample input for scouting
-downsample_factor: 4    # factor by which to downsample (e.g. 4 -> 1/4th resolution)
+downsample: False        # whether to downsample input for scouting
+downsample_factor: 1    # factor by which to downsample (e.g. 4 -> 1/4th resolution)
 
 #misc
 eps: 0.000001
