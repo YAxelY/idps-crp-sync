@@ -1,5 +1,4 @@
-name: 
-  /home/axel/Downloads/udsbooks/M2/Thesis/latex-sources/brainstorm/paper-code/Idps-crp/code01/idps-crp-sync/condavenv
+name: idps
 channels:
   - defaults
 dependencies:
@@ -110,5 +109,3 @@ dependencies:
       - werkzeug==3.1.5
       - wrapt==2.1.1
       - zipp==3.23.0
-prefix: 
-  /home/axel/Downloads/udsbooks/M2/Thesis/latex-sources/brainstorm/paper-code/Idps-crp/code01/idps-crp-sync/condavenv
