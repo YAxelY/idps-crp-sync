@@ -14,7 +14,7 @@ from data.megapixel_mnist.mnist_dataset import MegapixelMNIST
 from data.traffic.traffic_dataset import TrafficSigns
 from data.camelyon.camelyon_dataset import CamelyonFeatures
 from architecture.idps_net import IDPSNet
-from training.trainer import IDPSTrainer
+from training.iterative import train_one_epoch, evaluate
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -59,6 +59,9 @@ net = IDPSNet(conf).to(device)
 loss_nll = nn.NLLLoss()
 loss_bce = nn.BCELoss()
 
+# define optimizer, lr not important at this point
+optimizer = torch.optim.AdamW(net.parameters(), lr=0, weight_decay=conf.wd)
+
 criterions = {}
 for task in conf.tasks.values():
     criterions[task['name']] = loss_nll if task['act_fn'] == 'softmax' else loss_bce
@@ -66,32 +69,19 @@ for task in conf.tasks.values():
 log_writer_train = Logger(conf.tasks)
 log_writer_test = Logger(conf.tasks)
 
-# Trainer
-trainer = IDPSTrainer(net, train_data, criterions, log_writer_train, conf)
-
 print(f"Starting training on {dataset}...")
 for epoch in range(conf.n_epoch):
     
-    print(f"Epoch {epoch+1}/{conf.n_epoch}")
-    
     # Train
-    trainer.train_epoch(train_loader, epoch)
+    train_one_epoch(net, criterions, train_data, train_loader, optimizer, device, epoch, log_writer_train, conf)
+    
     log_writer_train.compute_metric()
-    log_writer_train.print_stats(epoch, train=True)
+    
+    more_to_print = {'lr': optimizer.param_groups[0]['lr']}
+    log_writer_train.print_stats(epoch, train=True, **more_to_print)
     
     # Evaluate
-    # Note: evaluate in trainer also uses self.log_writer (which is set to log_writer_train)
-    # We should probably pass the test logger to evaluate or handle it differently.
-    # But IDPSTrainer as implemented expects one log_writer in init.
-    # To fix this without changing trainer.py too much, we can swap the logger temporarily or instantiate a separate trainer for eval?
-    # No, cleaner: use trainer's evaluate but pass the test logger or update trainer to accept logger in evaluate.
-    # Looking at my trainer.py implementation: `evaluate` uses `self.log_writer`.
-    # I should update `evaluate` in `trainer.py` to accept a logger, OR just set `trainer.log_writer = log_writer_test` before eval.
+    evaluate(net, criterions, test_data, test_loader, device, log_writer_test, conf)
     
-    trainer.log_writer = log_writer_test
-    trainer.evaluate(test_loader, epoch)
     log_writer_test.compute_metric()
     log_writer_test.print_stats(epoch, train=False)
-    
-    # Reset for next epoch training
-    trainer.log_writer = log_writer_train
