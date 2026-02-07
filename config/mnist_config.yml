@@ -20,7 +20,7 @@ downsample_factor: 1    # factor by which to downsample (e.g. 4 -> 1/4th resolut
 eps: 0.000001
 seed: 0
 track_efficiency: True   # for training, needs to be False
-track_epoch: 10            # only relevant if efficiency stats are tracked.
+track_epoch: 9            # only relevant if efficiency stats are tracked.
 
 #enc
 is_image: True          # should a convolutional patch encoder be used?
