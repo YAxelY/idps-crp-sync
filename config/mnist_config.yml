@@ -39,6 +39,8 @@ K: 20                       # number of selected patches for learner (K < M)
 I: 100                      # iteration size
 patch_size: [50, 50]        # dims of patch
 patch_stride: [50, 50]      # stride of patch, use 25 per side for 50% overlap
+sigma: 0.05                 # perturbation noise for DPS
+num_samples: 500            # number of samples for DPS
 
 #aggr
 use_pos: True       # should positional encoding be used?

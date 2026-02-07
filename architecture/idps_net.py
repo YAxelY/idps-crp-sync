@@ -19,10 +19,9 @@ class IDPSNet(nn.Module):
 
         # Scorer / Aggregator
         # Used for computing "Importance Scores" in Pass 2
-        self.scorer_head = nn.Linear(self.D, 1) 
         
         # DPS Selector
-        self.dps_topk = PerturbedTopK(k=self.K, num_samples=500, sigma=0.05)
+        self.dps_topk = PerturbedTopK(k=self.K, num_samples=conf.num_samples, sigma=conf.sigma)
         
         # Aggregator (Transformer) runs on the K selected patches
         self.transf = Transformer(conf.n_token, conf.H, conf.D, conf.D_k, conf.D_v, conf.D_inner, conf.attn_dropout, conf.dropout)
@@ -72,8 +71,9 @@ class IDPSNet(nn.Module):
         """
         self.eval()
         embeddings = self._get_embeddings(wsi_patches)
-        # Simple attention or scoring
-        scores = self.scorer_head(embeddings).squeeze(-1) # (B, N)
+        # Use Transformer Attention Scores
+        # get_scores returns (B, N) - average attn over heads (and tasks if applicable)
+        scores = self.transf.get_scores(embeddings) 
         top_m_indices = torch.topk(scores, self.M, dim=-1)[1]
         return top_m_indices
 
@@ -93,8 +93,8 @@ class IDPSNet(nn.Module):
         # 1. Embed Candidates
         embeddings = self._get_embeddings(candidate_patches) # (B, M, D)
         
-        # 2. Score Candidates (Differentiable)
-        scores = self.scorer_head(embeddings).squeeze(-1) # (B, M)
+        # 2. Score Candidates (Differentiable, using Transformer)
+        scores = self.transf.get_scores(embeddings) # (B, M)
         
         # 3. DPS Selection (Soft Top-K Indicators)
         # indicators: (B, K, M) - One-hot-ish matrix pointing to selected K
