@@ -95,6 +95,11 @@ class IDPSNet(nn.Module):
         
         # 2. Score Candidates (Differentiable, using Transformer)
         scores = self.transf.get_scores(embeddings) # (B, M)
+
+        # Normalize scores to [0, 1]
+        scores_min = scores.min(dim=-1, keepdim=True)[0]
+        scores_max = scores.max(dim=-1, keepdim=True)[0]
+        scores = (scores - scores_min) / (scores_max - scores_min + 1e-5)
         
         # 3. DPS Selection (Soft Top-K Indicators)
         # indicators: (B, K, M) - One-hot-ish matrix pointing to selected K

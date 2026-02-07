@@ -1,7 +1,7 @@
 import sys
 import numpy as np
 import torch
-from utils.utils import adjust_learning_rate, Timer, get_gpu_memory
+from utils.utils import adjust_learning_rate, adjust_sigma, Timer, get_gpu_memory
 
 def compute_loss(net, preds, criterions, labels, conf):
     """
@@ -54,10 +54,17 @@ def train_one_epoch(net, criterions, train_data, data_loader, optimizer, device,
         
         # If tracking efficiency, record time from here.
         if conf.track_efficiency:
-            timer = Timer()
+            if torch.cuda.is_available():
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+            else:
+                timer = Timer()
 
         # Calculate and set new learning rate
         adjust_learning_rate(conf.n_epoch_warmup, conf.n_epoch, conf.lr, optimizer, data_loader, data_it+1)
+        # Adjust sigma
+        adjust_sigma(conf.n_epoch_warmup, conf.n_epoch, conf.sigma, net, data_loader, data_it+1)
         optimizer.zero_grad()
         
         # --- PASS 1: SCOUT ---
@@ -87,7 +94,12 @@ def train_one_epoch(net, criterions, train_data, data_loader, optimizer, device,
         # If tracking efficiency, log the time and memory usage
         if conf.track_efficiency:
             if epoch == conf.track_epoch and data_it > 0:
-                times.append(timer.elapsed())
+                if torch.cuda.is_available():
+                    end_event.record()
+                    torch.cuda.synchronize()
+                    times.append(start_event.elapsed_time(end_event))
+                else:
+                    times.append(timer.elapsed())
                 print("time: ", times[-1])
 
         # Update log
@@ -98,12 +110,18 @@ def train_one_epoch(net, criterions, train_data, data_loader, optimizer, device,
         if epoch == conf.track_epoch:
             print("avg. time: ", np.mean(times))
 
-            peak_bytes_requirement = get_gpu_memory()
-            print(f"Peak memory requirement: {peak_bytes_requirement:.4f} GB")
-
             if torch.cuda.is_available():
+                stats = torch.cuda.memory_stats()
+                peak_bytes_requirement = stats["allocated_bytes.all.peak"]
+                print(f"Peak memory requirement: {peak_bytes_requirement / 1024 ** 3:.4f} GB")
                 print("TORCH.CUDA.MEMORY_SUMMARY: ", torch.cuda.memory_summary())
+            else:
+                print("Peak memory requirement: N/A (CPU only)")
+            
             sys.exit()
+            
+        
+ 
 
 
 # Disable gradient calculation during evaluation
