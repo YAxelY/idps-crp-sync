@@ -1,141 +1,214 @@
+import math
 import torch
 import torch.nn as nn
-from .resnet import resnet18
-from .transformer import Transformer
-from .dps_module import PerturbedTopK
+from torchvision.models import resnet18, resnet50, ResNet18_Weights, ResNet50_Weights
+
+from architecture.resnet import resnet18 as custom_resnet18
+from architecture.transformer import Transformer, pos_enc_1d
+from architecture.dps_module import PerturbedTopK
 
 class IDPSNet(nn.Module):
+    """
+    Hybrid IDPS-CRP Network:
+    - Pass 1 (Scout): Iterative Patch Selection applied on downsampled patches.
+    - Pass 2 (Learner): Differentiable Patch Selection (DPS) + High-Res extraction.
+    """
+
+    def get_conv_patch_enc(self, enc_type, pretrained, n_chan_in, n_res_blocks):
+        # Using built-in resnets for the lightweight scout
+        if enc_type == 'resnet18': 
+            res_net_fn = resnet18
+            weights=ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        elif enc_type == 'resnet50':
+            res_net_fn = resnet50
+            weights=ResNet50_Weights.IMAGENET1K_V1 if pretrained else None        
+        else:
+            raise ValueError()
+
+        res_net = res_net_fn(weights=weights)
+
+        if n_chan_in == 1:
+            res_net.conv1 = nn.Conv2d(n_chan_in, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        
+        layer_ls = [
+            res_net.conv1,
+            res_net.bn1,
+            res_net.relu,
+            res_net.maxpool,
+            res_net.layer1,
+            res_net.layer2
+        ]
+
+        if n_res_blocks == 4:
+            layer_ls.extend([res_net.layer3, res_net.layer4])
+        
+        layer_ls.append(res_net.avgpool)
+        return nn.Sequential(*layer_ls)
+
     def __init__(self, conf):
         super().__init__()
-        self.device = conf.device
-        self.M = conf.M  # Number of Scouted patches (Candidates for Pass 2)
-        self.K = conf.K  # Number of Final patches selected by DPS (K < M)
-        self.D = conf.D 
+
         self.n_class = conf.n_class
-        
-        # Shared Backbone
-        self.encoder = resnet18(pretrained=conf.pretrained, num_channels=conf.n_chan_in, flatten=True)
-        self.projector = nn.Linear(512, self.D)
+        self.M = conf.M # Scout memory limit
+        self.K = conf.K # Learner selection limit
+        self.I = conf.I # Scout Iteration Chunk Size
+        self.D = conf.D 
+        self.use_pos = conf.use_pos
 
-        # Scorer / Aggregator
-        # Used for computing "Importance Scores" in Pass 2
-        
-        # DPS Selector
-        self.dps_topk = PerturbedTopK(k=self.K, num_samples=conf.num_samples, sigma=conf.sigma)
-        
-        # Aggregator (Transformer) runs on the K selected patches
-        self.transf = Transformer(conf.n_token, conf.H, conf.D, conf.D_k, conf.D_v, conf.D_inner, conf.attn_dropout, conf.dropout)
-        
-        # Heads (one per task)
-        self.tasks = conf.tasks
-        self.output_layers = self.get_output_layers(conf.tasks)
+        self.dps_sigma = conf.sigma
+        self.num_samples = conf.num_samples
 
-    def get_output_layers(self, tasks):
-        """
-        Create an output layer for each task according to task definition
-        """
-        output_layers = nn.ModuleDict()
-        for task in tasks.values():
-            if task['act_fn'] == 'softmax':
-                act_fn = nn.Softmax(dim=-1)
-            elif task['act_fn'] == 'sigmoid':
-                act_fn = nn.Sigmoid()
-            
-            layers = [
-                nn.Linear(self.D, self.n_class),
-                act_fn
-            ]
-            output_layers[task['name']] = nn.Sequential(*layers)
-        return output_layers
+        # ---- Shared Scout Components ----
+        # Lightweight encoder for downsampled patches
+        self.encoder_low = self.get_conv_patch_enc(conf.enc_type, conf.pretrained, conf.n_chan_in, conf.n_res_blocks)
+        
+        # Transformer Multi-Head Cross-Attention Scorer (Shared between IPS Pass 1 and DPS Pass 2)
+        # We reuse the same transformer architecture as IPS for scoring.
+        self.scorer = Transformer(conf.n_token, conf.H, conf.D, conf.D_k, conf.D_v, conf.D_inner, conf.attn_dropout, conf.dropout)
 
-    def _get_embeddings(self, patches):
-        B_dim = -1
-        if patches.dim() == 5:
-            B, N, C, H, W = patches.shape
-            B_dim = B
-            patches = patches.reshape(-1, C, H, W)
+        # ---- Learner Specific Components ----
+        # DPS Soft Selection Module
+        self.dps_topk = PerturbedTopK(k=self.K, num_samples=self.num_samples, sigma=self.dps_sigma)
         
-        feats = self.encoder(patches) 
-        embeddings = self.projector(feats) 
+        # Heavy encoder for the K High-Res patches
+        # Here we use the custom ResNet implementation from the original code for accurate 1-channel support
+        self.encoder_high = custom_resnet18(num_channels=conf.n_chan_in, pretrained=conf.pretrained, flatten=True)
         
-        if B_dim != -1:
-            embeddings = embeddings.view(B_dim, N, -1)
+        # Aggregator for High-Res features (Can reuse self.scorer or build a new one)
+        self.aggregator = Transformer(conf.n_token, conf.H, conf.D, conf.D_k, conf.D_v, conf.D_inner, conf.attn_dropout, conf.dropout)
+
+        # Classification Head
+        self.classifier = nn.Sequential(
+            nn.Linear(conf.D, conf.n_class),
+            # Do not use Softmax if using CrossEntropyLoss later! 
+            # (Assuming BCELoss/BCEWithLogitsLoss or CrossEntropy depending on dataset)
+            # Will output logits.
+        )
         
-        return embeddings
+        if self.use_pos:
+            self.pos_enc = pos_enc_1d(conf.D, conf.N).unsqueeze(0)
+        else:
+            self.pos_enc = None
+
+
+    def _score_and_select_m(self, emb, M, idx):
+        """ Scoring mechanism for the IPS loop """
+        # Obtain scores from transformer
+        attn = self.scorer.get_scores(emb) # (B, M+I)
+        # Hard Top-M Selection
+        top_idx = torch.topk(attn, M, dim=-1)[1] # (B, M)
+        
+        D_emb = emb.shape[-1]
+        mem_emb = torch.gather(emb, 1, top_idx.unsqueeze(-1).expand(-1, -1, D_emb))
+        mem_idx = torch.gather(idx, 1, top_idx)
+        return mem_emb, mem_idx
 
     @torch.no_grad()
-    def scouting_pass(self, wsi_patches):
+    def scouting_pass(self, patches_low):
         """
-        Pass 1: The Scout (Cheap/Heuristic)
-        Output: top_m_indices (B, M) - Candidates for Pass 2
-        """
-        self.eval()
-        embeddings = self._get_embeddings(wsi_patches)
-        # Use Transformer Attention Scores
-        # get_scores returns (B, N) - average attn over heads (and tasks if applicable)
-        scores = self.transf.get_scores(embeddings) 
-        top_m_indices = torch.topk(scores, self.M, dim=-1)[1]
-        return top_m_indices
-
-    def training_pass(self, candidate_patches):
-        """
-        Pass 2: The Learner (with DPS)
-        Input: candidate_patches (B, M, C, H, W) - The pool of likely candidates
-        Process:
-           1. Re-Embed M candidates (Grad ON).
-           2. Compute scores from embeddings.
-           3. DPS Select K from M (Differentiable).
-           4. Aggregate K patches.
-        """
-        self.train() 
-        B, M, C, H, W = candidate_patches.shape
+        Pass 1: Iterative Patch Selection on Downsampled Patches.
+        Runs in strictly no-gradient mode to save VRAM.
+        matches `ips(self, patches)` exactly.
         
-        # 1. Embed Candidates
-        embeddings = self._get_embeddings(candidate_patches) # (B, M, D)
-        
-        # 2. Score Candidates (Differentiable, using Transformer)
-        scores = self.transf.get_scores(embeddings) # (B, M)
+        patches_low: (B, N, C, H_low, W_low)
+        Returns:
+            global_indices: (B, M) -> The absolute indices of the best downsampled patches.
+        """
+        if self.training:
+            self.encoder_low.eval()
+            self.scorer.eval()
 
-        # Normalize scores to [0, 1]
+        device = patches_low.device
+        B, N = patches_low.shape[:2]
+        M = self.M
+        I = self.I
+
+        if M >= N:
+            # Trivial case
+            return torch.arange(N, device=device).unsqueeze(0).expand(B, N)
+
+        patch_shape = patches_low.shape
+        D = self.D
+        
+        # Init buffer (first M patches)
+        init_patch = patches_low[:, :M]
+        mem_emb = self.encoder_low(init_patch.reshape(-1, *patch_shape[2:]))
+        mem_emb = mem_emb.view(B, M, -1)
+        
+        global_idx = torch.arange(N, dtype=torch.int64, device=device).unsqueeze(0).expand(B, -1)
+        mem_idx = global_idx[:, :M]
+
+        n_iter = math.ceil((N - M) / I)
+        for i in range(n_iter):
+            start_idx = i * I + M
+            end_idx = min(start_idx + I, N)
+
+            iter_patch = patches_low[:, start_idx:end_idx]
+            iter_idx = global_idx[:, start_idx:end_idx]
+
+            iter_emb = self.encoder_low(iter_patch.reshape(-1, *patch_shape[2:]))
+            iter_emb = iter_emb.view(B, -1, D)
+            
+            all_emb = torch.cat((mem_emb, iter_emb), dim=1)
+            all_idx = torch.cat((mem_idx, iter_idx), dim=1)
+
+            mem_emb, mem_idx = self._score_and_select_m(all_emb, M, all_idx)
+
+        # Restore modes
+        if self.training:
+            self.encoder_low.train()
+            self.scorer.train()
+
+        return mem_idx
+
+    def training_pass(self, patches_low_m, patches_high_m):
+        """
+        Pass 2: Differentiable Learner.
+        Takes the M selected patches in BOTH downsampled and high-res forms.
+        
+        patches_low_m: (B, M, C, H_low, W_low) -> Same content selected in pass 1.
+        patches_high_m: (B, M, C, H_high, W_high)
+        """
+        B, M = patches_low_m.shape[:2]
+        device = patches_low_m.device
+        patch_shape_high = patches_high_m.shape
+
+        # 1. Re-Embed downsampled patches to enable gradients
+        embs_low = self.encoder_low(patches_low_m.reshape(-1, *patches_low_m.shape[2:]))
+        embs_low = embs_low.view(B, M, -1)
+
+        # 2. Score with Transformer
+        scores = self.scorer.get_scores(embs_low) # (B, M)
+        
+        # 0-1 Normalization for DPS stability
         scores_min = scores.min(dim=-1, keepdim=True)[0]
         scores_max = scores.max(dim=-1, keepdim=True)[0]
         scores = (scores - scores_min) / (scores_max - scores_min + 1e-5)
-        
-        # 3. DPS Selection (Soft Top-K Indicators)
-        # indicators: (B, K, M) - One-hot-ish matrix pointing to selected K
-        indicators = self.dps_topk(scores) 
-        
-        # 4. Soft Gather: Weighted Sum to get K "Selected" Embeddings
-        # (B, K, M) @ (B, M, D) -> (B, K, D)
-        selected_embeddings = torch.matmul(indicators, embeddings)
-        
-        # 5. Aggregate (Transformer)
-        # Output is (B, n_token, D).
-        slide_embeddings = self.transf(selected_embeddings) # (B, n_token, D)
-        
-        # 6. Classify for each task
-        preds = {}
-        for task in self.tasks.values():
-            t_name, t_id = task['name'], task['id']
-            layer = self.output_layers[t_name]
 
-            # If n_token > 1, we assume specific tokens for specific tasks 
-            # (assuming n_token matches number of tasks and ordered by ID, 
-            # OR we just use the t_id-th token)
-            # IPSNet uses `emb = embeddings[:,t_id]`
-            emb = slide_embeddings[:, t_id]
-            preds[t_name] = layer(emb)
+        # 3. DPS Soft Selection (Perturbed Top-K)
+        # indicators: (B, K, M)
+        indicators = self.dps_topk(scores)
+
+        # 4. Memory Trick: Soft Gather High-Res Patches
+        # patches_high_m: (B, M, C, H_high, W_high)
+        # We want (B, K, C, H_high, W_high).
+        # Einsum: bkm (indicators), bmchw (high-res patches) -> bkchw
+        selected_high_res = torch.einsum('bkm,bmchw->bkchw', indicators, patches_high_m)
+
+        # 5. Heavy Feature Extraction on K high-res patches
+        K, C, H, W = selected_high_res.shape[1:]
+        embs_high = self.encoder_high(selected_high_res.reshape(-1, C, H, W))
+        embs_high = embs_high.view(B, K, -1)
+
+        # 6. Aggregation & Classification
+        agg_feats = self.aggregator(embs_high) # (B, D) depending on Transformer logic
+        # Usually transformer returns (B, D) if taking CLS token, or (B, K, D). Assuming (B, D) from ips design task
         
+        # If transformer returns sequence, pool it. Assume IDPS transformer returns (B, D) from prototype
+        if agg_feats.dim() == 3:
+            # if (B, K, D), mean pool
+            agg_feats = agg_feats.mean(dim=1)
+            
+        preds = self.classifier(agg_feats)
+
         return preds
-
-    def forward(self, x, mode='train'):
-        """
-        Convenience wrapper.
-        Real training loop will call scouting_pass and training_pass explicitly.
-        """
-        if mode == 'scout':
-            return self.scouting_pass(x)
-        elif mode == 'learn':
-            return self.training_pass(x)
-        else:
-            raise ValueError("Use explicit scouting_pass or training_pass")

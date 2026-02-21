@@ -1,155 +1,125 @@
 import sys
 import numpy as np
 import torch
-from utils.utils import adjust_learning_rate, adjust_sigma, Timer, get_gpu_memory
 
-def compute_loss(net, preds, criterions, labels, conf):
-    """
-    Obtain predictions, compute losses for each task and get some logging stats
-    """
-    # preds are already computed in IDPS logic (training_pass returns them)
-    
-    # Compute losses for each task and sum them up
+from utils.utils import adjust_learning_rate, adjust_sigma
+
+def compute_loss(net, preds, labels, conf):
+    """ Compute losses for each task and sum them up """
     loss = 0
     task_losses, task_preds, task_labels = {}, {}, {}
     for task in conf.tasks.values():
-        t_name, t_act = task['name'], task['act_fn']
+        t_name = task['name']
+        t_act = task['act_fn']
+        label = labels[t_name].to(preds.device)
+        pred = preds.squeeze(-1) # Assuming single task for now or preds dict
 
-        criterion = criterions[t_name]
-        label = labels[t_name]
-        pred = preds[t_name].squeeze(-1)
-
-        if t_act == 'softmax':
-            pred_loss = torch.log(pred + conf.eps)
-            label_loss = label
-        else:
-            pred_loss = pred.view(-1)
-            label_loss = label.view(-1).type(torch.float32)
-
-        task_loss = criterion(pred_loss, label_loss)
-        # for logs
+        # BCE or CrossEntropy based on your config. Assuming CrossEntropy for MNIST tasks here.
+        criterion = torch.nn.CrossEntropyLoss()
+        
+        task_loss = criterion(pred, label)
+        
         task_losses[t_name] = task_loss.item()
-        task_preds[t_name] = pred.detach().cpu().numpy()
+        
+        if t_act == 'softmax':
+            task_preds[t_name] = torch.softmax(pred, dim=-1).detach().cpu().numpy()
+        else:
+            task_preds[t_name] = pred.detach().cpu().numpy()
+            
         task_labels[t_name] = label.detach().cpu().numpy()
 
         loss += task_loss
-    # Average task losses        
-    loss /= len(conf.tasks.values())
 
+    loss /= len(conf.tasks.values())
     return loss, [task_losses, task_preds, task_labels]
 
-
-def train_one_epoch(net, criterions, train_data, data_loader, optimizer, device, epoch, log_writer, conf):
-    """
-    Trains the given network for one epoch according to given criterions (loss functions)
-    """
-
-    # Set the network to training mode
+def train_one_epoch(net, criterions, data_loader, optimizer, device, epoch, log_writer, conf):
     net.train()
+    times = []
 
-    times = [] # only used when tracking efficiency stats
-    
-    # Loop through dataloader
-    for data_it, data in enumerate(data_loader, start=epoch * len(data_loader)):
+    # Our custom collate_fn ensures data is a list of raw dicts
+    for data_it, batch_data_list in enumerate(data_loader, start=epoch * len(data_loader)):
         
-        # If tracking efficiency, record time from here.
         if conf.track_efficiency:
-            if torch.cuda.is_available():
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-                start_event.record()
-            else:
-                timer = Timer()
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
 
-        # Calculate and set new learning rate
+        # Update Schedulers
         adjust_learning_rate(conf.n_epoch_warmup, conf.n_epoch, conf.lr, optimizer, data_loader, data_it+1)
-        # Adjust sigma
-        adjust_sigma(conf.n_epoch_warmup, conf.n_epoch, conf.sigma, net, data_loader, data_it+1)
+        sigma = adjust_sigma(epoch, conf.max_sigma, conf.warmup_sigma)
+        net.dps_sigma = sigma
+        net.dps_topk.sigma = sigma
+
         optimizer.zero_grad()
-        
-        # --- PASS 1: SCOUT ---
-        low_res_patches = train_data.get_scout_data(data).to(device)
-        top_m_indices = net.scouting_pass(low_res_patches) # (B, M)
-        
-        # --- PASS 2: LEARNER (With DPS) ---
-        top_m_indices_cpu = top_m_indices.cpu()
-        candidate_patches = train_data.get_learner_data(data, top_m_indices_cpu).to(device)
 
-        # Forward (returns dict of predictions)
-        preds = net.training_pass(candidate_patches)
+        # ---- PASS 1: SCOUT ----
+        # 1. Fetch Downsampled Patches Lazy
+        patches_low, labels = data_loader.dataset.get_scout_data(batch_data_list)
+        patches_low = patches_low.to(device)
         
-        # Prepare labels relative to device
-        labels = {}
-        for task in conf.tasks.values():
-            labels[task['name']] = data[task['name']].to(device)
+        # 2. Iterative Filtering (IPS style)
+        # top_m_indices: (B, M)
+        top_m_indices = net.scouting_pass(patches_low)
+        
+        # ---- PASS 2: LEARNER ----
+        # 1. We already have the M downsampled patches in memory, we just gather them.
+        B, N, C, H_low, W_low = patches_low.shape
+        D_exp = len(patches_low.shape) - 2 # 3
+        
+        expanded_indices = top_m_indices.view(B, -1, *(1,)*D_exp).expand(-1, -1, C, H_low, W_low)
+        patches_low_m = torch.gather(patches_low, 1, expanded_indices) # (B, M, C, H_low, W_low)
 
-        # Compute loss
-        loss, task_info = compute_loss(net, preds, criterions, labels, conf)
+        # 2. Fetch High-Res Patches Lazy
+        # We only pass the indices back to the dataset.
+        patches_high_m = data_loader.dataset.get_learner_data(batch_data_list, top_m_indices)
+        patches_high_m = patches_high_m.to(device)
+
+        # 3. Differentiable Selection & Prediction
+        preds = net.training_pass(patches_low_m, patches_high_m)
+
+        # 4. Computed Loss over K High-Res Patches and Backprop
+        loss, task_info = compute_loss(net, preds, labels, conf)
         task_losses, task_preds, task_labels = task_info
 
-        # Backpropagate error and update parameters
         loss.backward()
         optimizer.step()
 
-        # If tracking efficiency, log the time and memory usage
         if conf.track_efficiency:
+            end_event.record()
+            torch.cuda.synchronize()
             if epoch == conf.track_epoch and data_it > 0:
-                if torch.cuda.is_available():
-                    end_event.record()
-                    torch.cuda.synchronize()
-                    times.append(start_event.elapsed_time(end_event))
-                else:
-                    times.append(timer.elapsed())
-                print("time: ", times[-1])
+                times.append(start_event.elapsed_time(end_event))
 
-        # Update log
         log_writer.update(task_losses, task_preds, task_labels)
 
-    
-    if conf.track_efficiency:
-        if epoch == conf.track_epoch:
-            print("avg. time: ", np.mean(times))
-
-            if torch.cuda.is_available():
-                stats = torch.cuda.memory_stats()
-                peak_bytes_requirement = stats["allocated_bytes.all.peak"]
-                print(f"Peak memory requirement: {peak_bytes_requirement / 1024 ** 3:.4f} GB")
-                print("TORCH.CUDA.MEMORY_SUMMARY: ", torch.cuda.memory_summary())
-            else:
-                print("Peak memory requirement: N/A (CPU only)")
-            
-            sys.exit()
-            
-        
- 
+    if conf.track_efficiency and epoch == conf.track_epoch:
+        stats = torch.cuda.memory_stats()
+        peak_bytes_requirement = stats["allocated_bytes.all.peak"]
+        print(f"Peak memory requirement: {peak_bytes_requirement / 1024 ** 3:.4f} GB")
+        sys.exit()
 
 
-# Disable gradient calculation during evaluation
 @torch.no_grad()
-def evaluate(net, criterions, test_data, data_loader, device, log_writer, conf):
-
-    # Set the network to evaluation mode
+def evaluate(net, criterions, data_loader, device, log_writer, conf):
     net.eval()
+    
+    for batch_data_list in data_loader:
+        patches_low, labels = data_loader.dataset.get_scout_data(batch_data_list)
+        patches_low = patches_low.to(device)
+        
+        top_m_indices = net.scouting_pass(patches_low)
+        
+        B, N, C, H_low, W_low = patches_low.shape
+        expanded_indices = top_m_indices.view(B, -1, *(1,)*3).expand(-1, -1, C, H_low, W_low)
+        patches_low_m = torch.gather(patches_low, 1, expanded_indices) 
 
-    for data in data_loader:
-        
-        # --- PASS 1: SCOUT ---
-        low_res_patches = test_data.get_scout_data(data).to(device)
-        top_m_indices = net.scouting_pass(low_res_patches) 
-        
-        # --- PASS 2: LEARNER ---
-        top_m_indices_cpu = top_m_indices.cpu()
-        candidate_patches = test_data.get_learner_data(data, top_m_indices_cpu).to(device)
-        
-        preds = net.training_pass(candidate_patches)
-        
-        # Prepare labels
-        labels = {}
-        for task in conf.tasks.values():
-            labels[task['name']] = data[task['name']].to(device)
+        patches_high_m = data_loader.dataset.get_learner_data(batch_data_list, top_m_indices)
+        patches_high_m = patches_high_m.to(device)
 
-        # Compute loss
-        _, task_info = compute_loss(net, preds, criterions, labels, conf)
+        preds = net.training_pass(patches_low_m, patches_high_m)
+
+        _, task_info = compute_loss(net, preds, labels, conf)
         task_losses, task_preds, task_labels = task_info
 
         log_writer.update(task_losses, task_preds, task_labels)

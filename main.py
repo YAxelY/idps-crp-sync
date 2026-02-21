@@ -49,9 +49,11 @@ elif dataset == 'camelyon':
     test_data = CamelyonFeatures(conf, train=False)
 
 train_loader = DataLoader(train_data, batch_size=conf.B_seq, shuffle=True,
-    num_workers=conf.n_worker, pin_memory=conf.pin_memory, persistent_workers=True)
+    num_workers=conf.n_worker, pin_memory=conf.pin_memory, persistent_workers=True,
+    collate_fn=lambda x: x if dataset == 'mnist' else None)
 test_loader = DataLoader(test_data, batch_size=conf.B_seq, shuffle=False,
-    num_workers=conf.n_worker, pin_memory=conf.pin_memory, persistent_workers=True)
+    num_workers=conf.n_worker, pin_memory=conf.pin_memory, persistent_workers=True,
+    collate_fn=lambda x: x if dataset == 'mnist' else None)
 
 # define network
 net = IDPSNet(conf).to(device)
@@ -73,7 +75,7 @@ print(f"Starting training on {dataset}...")
 for epoch in range(conf.n_epoch):
     
     # Train
-    train_one_epoch(net, criterions, train_data, train_loader, optimizer, device, epoch, log_writer_train, conf)
+    train_one_epoch(net, criterions, train_loader, optimizer, device, epoch, log_writer_train, conf)
     
     log_writer_train.compute_metric()
     
@@ -81,7 +83,7 @@ for epoch in range(conf.n_epoch):
     log_writer_train.print_stats(epoch, train=True, **more_to_print)
     
     # Evaluate
-    evaluate(net, criterions, test_data, test_loader, device, log_writer_test, conf)
+    evaluate(net, criterions, test_loader, device, log_writer_test, conf)
     
     log_writer_test.compute_metric()
     log_writer_test.print_stats(epoch, train=False)

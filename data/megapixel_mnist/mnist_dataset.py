@@ -5,109 +5,137 @@ import torch
 import torch.nn.functional as F
 
 class MegapixelMNIST(torch.utils.data.Dataset):
-    """ Loads the Megapixel MNIST dataset """
+    """ Loads the Megapixel MNIST dataset with true lazy loading """
 
     def __init__(self, conf, train=True):
         with open(os.path.join(conf.data_dir, "parameters.json")) as f:
             self.parameters = json.load(f)
         
         self.conf = conf
-
         self.patch_size = conf.patch_size
         self.patch_stride = conf.patch_stride
         self.tasks = conf.tasks
 
         filename = "train.npy" if train else "test.npy"
-        W = self.parameters["width"]
-        H = self.parameters["height"]
-
-        self._img_shape = (H, W, 1)
+        self.W = self.parameters["width"]
+        self.H = self.parameters["height"]
+        
+        # Load sparse data annotations
         self._data = np.load(os.path.join(conf.data_dir, filename), allow_pickle=True)
 
     def __len__(self):
         return len(self._data)
 
     def __getitem__(self, i):
+        """ 
+        Just returns the raw dictionary with sparse coordinates instead of 
+        reconstructing the gigapixel image eagerly in RAM/VRAM.
+        """
         if i >= len(self):
             raise IndexError()
+        return self._data[i]
 
-        patch_size = self.patch_size
-        patch_stride = self.patch_stride
-
-        # Placeholders
-        img = np.zeros(self._img_shape, dtype=np.float32).ravel()
-
-        # Fill the sparse representations
-        data = self._data[i]
+    def _reconstruct_dense(self, data):
+        """ Reconstruct full image on CPU. Internal helper, avoid calling if possible. """
+        img = np.zeros((self.H, self.W, 1), dtype=np.float32).ravel()
         img[data['input'][0]] = data['input'][1]
+        img = img.reshape((self.H, self.W, 1))
+        img = torch.from_numpy(img).permute(2, 0, 1) # (1, H, W)
+        return img
 
-        # Reshape to final shape        
-        img = img.reshape(self._img_shape)
-        img = torch.from_numpy(img)
-        img = img.permute(2, 0, 1)
-
-        # Extract patches
-        patches = img.unfold(
-            1, patch_size[0], patch_stride[0]
-        ).unfold(
-            2, patch_size[1], patch_stride[1]
-        ).permute(1, 2, 0, 3, 4)
-        
-        patches = patches.reshape(-1, *patches.shape[2:])
-
-        data_dict = {'input': patches}
-        for task in self.tasks.values():
-            data_dict[task['name']] = data[task['name']] 
-
-        return data_dict
-
-    def get_scout_data(self, batch_data):
+    def get_scout_data(self, batch_data_list):
         """
-        Returns the data for the 'Scout' (Pass 1).
-        If downsample is enabled, interpolates the patches.
+        Takes a list of raw sparse data dicts (batch).
+        Reconstructs the full image on CPU, spatially downsamples it directly 
+        (e.g., 1500x1500 -> 300x300), and then extracts the corresponding downsampled patches.
+        This provides the Scout phase with global context WITHOUT extracting heavy Nx(1x50x50) tensors.
+        Returns: 
+           patches: (B, N, C, H_low, W_low)
+           labels: dict of stacked tensors
         """
-        patches = batch_data['input'] # (B, N, C, H, W) or (B, N, H, W, C) depending on loading
-        # Patches are already standard tensors due to collate or init? 
-        # Actually in __getitem__ they are permuted to (1, 2, 0, 3, 4) then reshaped
-        # patches shape here from loader: (B, N, C, H, W)
-        
-        if self.conf.downsample:
-            # Flatten to (B*N, C, H, W) for interpolation
-            B, N, C, H, W = patches.shape
-            patches_flat = patches.view(-1, C, H, W)
-            
-            # Downsample
-            # e.g. 50x50 -> 12x12
-            new_size = (H // self.conf.downsample_factor, W // self.conf.downsample_factor)
-            
-            patches_small = F.interpolate(patches_flat, size=new_size, mode='bilinear', align_corners=False)
-            
-            # Reshape back
-            patches = patches_small.view(B, N, C, new_size[0], new_size[1])
-            
-        return patches
+        batch_size = len(batch_data_list)
+        B_patches = []
+        labels = {task['name']: [] for task in self.tasks.values()}
 
-    def get_learner_data(self, batch_data, indices):
+        for i in range(batch_size):
+            data = batch_data_list[i]
+            
+            # 1. Reconstruct full WSI (1, H, W)
+            img = self._reconstruct_dense(data).unsqueeze(0) # (1, 1, H, W)
+            
+            # 2. Downsample the whole image directly
+            # E.g., if downsample_factor=5, 1500x1500 -> 300x300
+            # If so, the patch size and stride must also be scaled down equivalently!
+            if hasattr(self.conf, 'downsample_factor') and self.conf.downsample_factor > 1:
+                df = self.conf.downsample_factor
+                img_low = F.interpolate(img, scale_factor=1.0/df, mode='bilinear', align_corners=False)
+                p_size = (self.patch_size[0] // df, self.patch_size[1] // df)
+                p_stride = (self.patch_stride[0] // df, self.patch_stride[1] // df)
+            else:
+                img_low = img
+                p_size = self.patch_size
+                p_stride = self.patch_stride
+            
+            img_low = img_low.squeeze(0) # (1, H_low, W_low)
+            
+            # 3. Extract Downsampled Patches
+            patches = img_low.unfold(
+                1, p_size[0], p_stride[0]
+            ).unfold(
+                2, p_size[1], p_stride[1]
+            ).permute(1, 2, 0, 3, 4)
+            patches = patches.reshape(-1, *patches.shape[2:]) # (N, 1, p_size, p_size)
+            
+            B_patches.append(patches)
+            for task in self.tasks.values():
+                labels[task['name']].append(torch.tensor(data[task['name']]))
+        
+        # Stack into batch
+        batch_patches = torch.stack(B_patches) # (B, N, 1, p_h, p_w)
+        batch_labels = {k: torch.stack(v) for k, v in labels.items()}
+        
+        return batch_patches, batch_labels
+
+    def get_learner_data(self, batch_data_list, indices):
         """
-        Returns the High-Res data for the 'Learner' (Pass 2).
-        indices: (B, M) - Indices of patches to select
+        Takes the raw sparse batch AND the chosen M indices from Scout.
+        Extracts ONLY the requested M high-resolution patches per item in the batch.
+        
+        indices: (B, M) tensor from Scout (CPU or GPU, will move to CPU to slice)
+        Returns:
+           selected_patches_high: (B, M, C, H_high, W_high)
         """
-        input_patches = batch_data['input'] # (B, N, C, H, W)
-        
-        # Gather patches
-        # indices are likely on GPU, input_patches might be CPU if lazy, but here likely GPU due to training loop
-        # We need to gather strictly.
-        
-        B, M = indices.shape
-        B_in, N, C, H, W = input_patches.shape
-        
-        # We need to select specific patches.
-        # Simple for loop for clarity or gather magic.
-        # advanced indexing: Input[i, indices[i]]
-        
-        # Create batch indices [0, 1, ... B-1] repeated M times -> (B, M)
-        batch_idx = torch.arange(B, device=indices.device).unsqueeze(1).expand(B, M)
-        
-        selected_patches = input_patches[batch_idx, indices] # (B, M, C, H, W)
-        
-        return selected_patches
+        indices = indices.cpu()
+        batch_size, M = indices.shape
+        B_patches_high = []
+
+        # Find how many patches there are per dimension to map 1D index -> 2D (y, x)
+        # N_h = (H - patch_size) // patch_stride + 1
+        n_h = (self.H - self.patch_size[0]) // self.patch_stride[0] + 1
+        n_w = (self.W - self.patch_size[1]) // self.patch_stride[1] + 1
+
+        for i in range(batch_size):
+            data = batch_data_list[i]
+            # Since we only need M patches, reconstructing the whole img might still be simpler
+            # than advanced sparse querying, but we ONLY unfold and extract M patches.
+            img = self._reconstruct_dense(data) # (1, H, W)
+            
+            m_patches = []
+            for m in range(M):
+                idx = indices[i, m].item()
+                # 1D index to 2D grid
+                grid_y = idx // n_w
+                grid_x = idx % n_w
+                
+                # Image pixel coordinates
+                start_h = grid_y * self.patch_stride[0]
+                start_w = grid_x * self.patch_stride[1]
+                end_h = start_h + self.patch_size[0]
+                end_w = start_w + self.patch_size[1]
+                
+                patch = img[:, start_h:end_h, start_w:end_w] # (1, P_h, P_w)
+                m_patches.append(patch)
+            
+            B_patches_high.append(torch.stack(m_patches)) # (M, 1, P_h, P_w)
+            
+        return torch.stack(B_patches_high) # (B, M, 1, P_h, P_w)
