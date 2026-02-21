@@ -41,6 +41,8 @@ patch_size: [50, 50]        # dims of patch
 patch_stride: [50, 50]      # stride of patch, use 25 per side for 50% overlap
 sigma: 0.05                 # perturbation noise for DPS
 num_samples: 500            # number of samples for DPS
+max_sigma: 0.1              # starting sigma for scheduler
+warmup_sigma: 100           # warmup steps for sigma scheduler
 
 #aggr
 use_pos: True       # should positional encoding be used?
