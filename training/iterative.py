@@ -47,9 +47,8 @@ def train_one_epoch(net, criterions, data_loader, optimizer, device, epoch, log_
 
         # Update Schedulers
         adjust_learning_rate(conf.n_epoch_warmup, conf.n_epoch, conf.lr, optimizer, data_loader, data_it+1)
-        sigma = adjust_sigma(epoch, conf.max_sigma, conf.warmup_sigma)
-        net.dps_sigma = sigma
-        net.dps_topk.sigma = sigma
+        adjust_sigma(conf.warmup_sigma, conf.n_epoch, conf.max_sigma, net, data_loader, data_it+1)
+        optimizer.zero_grad()
 
         optimizer.zero_grad()
 
