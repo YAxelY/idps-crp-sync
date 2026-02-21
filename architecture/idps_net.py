@@ -73,6 +73,10 @@ class IDPSNet(nn.Module):
         # Heavy encoder for the K High-Res patches
         # Here we use the custom ResNet implementation from the original code for accurate 1-channel support
         self.encoder_high = custom_resnet18(num_channels=conf.n_chan_in, pretrained=conf.pretrained, flatten=True)
+        self.high_adapter = nn.Sequential(
+            nn.Linear(512, conf.D),
+            nn.LayerNorm(conf.D)
+        )
         
         # Aggregator for High-Res features (Can reuse self.scorer or build a new one)
         self.aggregator = Transformer(conf.n_token, conf.H, conf.D, conf.D_k, conf.D_v, conf.D_inner, conf.attn_dropout, conf.dropout)
@@ -198,6 +202,7 @@ class IDPSNet(nn.Module):
         # 5. Heavy Feature Extraction on K high-res patches
         K, C, H, W = selected_high_res.shape[1:]
         embs_high = self.encoder_high(selected_high_res.reshape(-1, C, H, W))
+        embs_high = self.high_adapter(embs_high) # Adapt 512 -> conf.D
         embs_high = embs_high.view(B, K, -1)
 
         # 6. Aggregation & Classification
